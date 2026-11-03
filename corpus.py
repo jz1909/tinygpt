@@ -1,6 +1,6 @@
 import torch
 
-class corpus:
+class Corpus:
 
     def __init__(self, dataset_address):
 
@@ -55,6 +55,7 @@ class tokenizer:
     def __init__(self, dataset):
 
         self.chars = sorted(list(set(dataset)))
+        self.vocab_size = len(self.chars)
         self.string_to_int = {ch: i for i, ch in enumerate(self.chars)}
         self.int_to_string = {i: ch for i, ch in enumerate(self.chars)}
 
