@@ -4,19 +4,47 @@ from torch.nn import functional as F
 from corpus import Corpus
 import time
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cpu' 
 
 class BigramLM(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size,block_size, n_embd):
         super().__init__()
 
         # a look up for for the logit row for each token in the vocab
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.block_size = block_size
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.positional_encoding_table = nn.Embedding(block_size, n_embd)
+        self.head_size = 16
+        self.lm_head = nn.Linear(self.head_size, vocab_size)
+
+        self.key = nn.Linear(n_embd, self.head_size)
+        self.query = nn.Linear(n_embd, self.head_size)
+        self.value = nn.Linear(n_embd, self.head_size)
+
     
     def forward(self, idx, targets=None):
 
-        logits = self.token_embedding_table(idx) # (B, T, C) -> (4, 8, C)
+        #idx -> (B,T)
+
+        B, T = idx.shape
+        token_embeddings = self.token_embedding_table(idx) # (B, T, C) -> (4, 8, C)
+        positional_embeddings = self.positional_encoding_table(torch.arange(T, device=device)) # (T, C) -> (8, C)
+        x = token_embeddings + positional_embeddings 
+
+        #Now, each token has an embedding representation, but we have to add dataset dependent info to the embedding 
+
+        #Self Attention
+        key = self.key(x) #(B, T, head_size)
+        query = self.query(x) #(B, T, head_size)
+        #Now this matrix holds value of how tokens attends to each other
+        wei = query @ key.transpose(-2, -1) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
+        wei = wei.masked_fill(torch.tril(torch.ones((B,T,T), device=device)) == 0, float('-inf'))
+        wei = wei / (self.head_size ** 0.5) # We need to scale or softmax will make high values sharpen to one-hot
+        wei = F.softmax(wei, dim=-1)
+        v = self.value(x) #(B, T, head_size)
+        out = wei @ v #(B, T, T) @ (B, T, head_size) -> (B, T, head_size)
+        logits = self.lm_head(out) # (B, T, head_size) -> (4, 8, vocab_size)
 
         if targets == None:
             loss=None
@@ -35,11 +63,13 @@ class BigramLM(nn.Module):
         """
 
         for _ in range(max_new_tokens):
-            logits, loss = self.forward(idx)
+            idx_cond = idx[:, -self.block_size:] # crop idx to the last block_size tokens, or else we keep on putting in longer idx so that pos encoding will overflow
+            logits, loss = self.forward(idx_cond)
             logits = logits[:,-1, :] # We only care about the last character in the block size -> (B, C)
             probs = F.softmax(logits, dim=-1) 
             idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+
 
         return idx
 
@@ -65,7 +95,7 @@ def train_bigram(model,corpus, batch_size, block_size, lr, epochs):
 if __name__ == "__main__":
 
     corpus = Corpus("input.txt")
-    model = BigramLM(corpus.tokenizer.vocab_size).to(device)
+    model = BigramLM(vocab_size=corpus.tokenizer.vocab_size, block_size=8, n_embd=32).to(device)
     xb, yb = corpus.get_batch('train', block_size=8, batch_size=4)
     # logits, loss = model(xb, yb)
     # print(f"Logits: {logits.shape}, Loss: {loss.item()}")
