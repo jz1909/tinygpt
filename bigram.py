@@ -17,34 +17,17 @@ class BigramLM(nn.Module):
         self.positional_encoding_table = nn.Embedding(block_size, n_embd)
         self.head_size = 16
         self.lm_head = nn.Linear(self.head_size, vocab_size)
-
-        self.key = nn.Linear(n_embd, self.head_size)
-        self.query = nn.Linear(n_embd, self.head_size)
-        self.value = nn.Linear(n_embd, self.head_size)
-
     
     def forward(self, idx, targets=None):
 
         #idx -> (B,T)
 
         B, T = idx.shape
-        token_embeddings = self.token_embedding_table(idx) # (B, T, C) -> (4, 8, C)
-        positional_embeddings = self.positional_encoding_table(torch.arange(T, device=device)) # (T, C) -> (8, C)
-        x = token_embeddings + positional_embeddings 
+        token_embeddings = self.token_embedding_table(idx) # (B, T, n_embd) 
+        positional_embeddings = self.positional_encoding_table(torch.arange(T, device=device)) # (T, n_embd) 
+        x = token_embeddings + positional_embeddings #(B, T, n_embd)
 
-        #Now, each token has an embedding representation, but we have to add dataset dependent info to the embedding 
-
-        #Self Attention
-        key = self.key(x) #(B, T, head_size)
-        query = self.query(x) #(B, T, head_size)
-        #Now this matrix holds value of how tokens attends to each other
-        wei = query @ key.transpose(-2, -1) # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
-        wei = wei.masked_fill(torch.tril(torch.ones((B,T,T), device=device)) == 0, float('-inf'))
-        wei = wei / (self.head_size ** 0.5) # We need to scale or softmax will make high values sharpen to one-hot
-        wei = F.softmax(wei, dim=-1)
-        v = self.value(x) #(B, T, head_size)
-        out = wei @ v #(B, T, T) @ (B, T, head_size) -> (B, T, head_size)
-        logits = self.lm_head(out) # (B, T, head_size) -> (4, 8, vocab_size)
+        logits = nn.Linear(self.n_embd, self.vocab_size)(x) # (B, T, n_embd) -> (B, T, vocab_size)
 
         if targets == None:
             loss=None
