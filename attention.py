@@ -46,6 +46,34 @@ class multiheadAttention(nn.Module):
         out = torch.cat([head(x) for head in self.heads], dim=-1)
         return out
 
+class feedforward(nn.module):
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.n_embd = n_embd 
+
+        self.net = nn.sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+
+    def __init__(self, n_embd, num_heads):
+        super().__init__()
+        head_size = n_embd//head_size
+        self.sa = multiheadAttention(n_embd, head_size, num_heads)
+        self.feedforward = feedforward(n_embd)
+
+    def forward(self, x):
+        x = self.sa(x)
+        x = self.feedforward(x)
+
+        return x
+
 
 class BigramLM(nn.Module):
 
@@ -58,7 +86,12 @@ class BigramLM(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.positional_encoding_table = nn.Embedding(block_size, n_embd)
         #We want n_embd//4 here because then, concatenated together, we get n_embd again, which we need for either residuals or the final linear layer
-        self.sa_heads = multiheadAttention(n_embd=n_embd, head_size=n_embd//4, num_heads=4) #(B, T, n_embd)
+        self.blocks = nn.Sequential(
+            Block(n_embd, num_heads=4),
+            Block(n_embd, num_heads=4),
+            Block(n_embd, num_heads=4),
+        )
+        self.feedforward = feedforward(n_embd) 
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
 
@@ -74,7 +107,10 @@ class BigramLM(nn.Module):
 
         #Now, each token has an embedding representation, but we have to add dataset dependent info to the embedding 
 
-        out = self.sa_heads(x) #(B, T, n_embd) 
+        x = self.blocks(x) #(B, T, n_embd) 
+
+        #While the tokens are attending each other, they haven't really gotten time to 'talk' to each other. This allows for that
+        out = self.feedforward(x) #(B, T, n_embd) 
         logits = self.lm_head(out) # (B, T, vocab_size) 
 
         if targets == None:
