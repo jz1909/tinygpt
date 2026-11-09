@@ -39,41 +39,73 @@ class multiheadAttention(nn.Module):
     def __init__(self, n_embd, head_size, num_heads):
         super().__init__()
         self.heads = nn.ModuleList([attentionHead(n_embd, head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
 
     def forward(self, x):
 
         #We assume B, T are the same, and stack each output along the dim - each stack will be able to get a pool of their own softmax to ask their own questions
         out = torch.cat([head(x) for head in self.heads], dim=-1)
+
+        #The reason why we need this is because if we are to combine back with x with addition, the information encoded from the self attention block must align. I.e, the number at 2nd head position encodes its relation with xyz noun, whereas the same position in x might mean something completely different. We didn't have this problem without residual connections because the layers could learn these behaviors by themselves, without conforming back to x. However, we now need a projection layer (one which learns how to map the information in the self attention layer) to help the self attention block conform back to x
+        
+        out = self.proj(out)
         return out
 
-class feedforward(nn.module):
+class feedforward(nn.Module):
 
     def __init__(self, n_embd):
         super().__init__()
         self.n_embd = n_embd 
 
-        self.net = nn.sequential(
-            nn.Linear(n_embd, n_embd),
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4*n_embd), #grow the size here for more computation to capture more detail
             nn.ReLU(),
         )
 
+        self.proj = nn.Linear(4*n_embd, n_embd)
+
     def forward(self, x):
-        return self.net(x)
+        out = self.net(x)
+        out = self.proj(out)
+        return out 
+
+class layerNorm3D(nn.Module):
+
+    def __init__(self, dim, eps = 1e-5):
+        """
+        dim -> dimensions of the n_embds, so that gamma and beta know their size
+        eps -> guard against dividing by zero if var is 0
+        """
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        mean = torch.mean(x, -1, keepdim=True) #x is (B, T, C), so setting mean dim to -1 is going to mean to (B, T, 1)
+        var = torch.var(x, -1, keepdim=True, unbiased=False)
+        xhat = ((x - mean)/(torch.sqrt(var+self.eps)))
+        out = self.gamma * xhat + self.beta
+        return out
+
 
 class Block(nn.Module):
 
     def __init__(self, n_embd, num_heads):
         super().__init__()
-        head_size = n_embd//head_size
+        head_size = n_embd//num_heads
         self.sa = multiheadAttention(n_embd, head_size, num_heads)
         self.feedforward = feedforward(n_embd)
+        #Layer norm prevents inputs from getting exponentially blown up or killed
+        self.layer_norm1 = layerNorm3D(n_embd)
+        self.layer_norm2 = layerNorm3D(n_embd)
 
     def forward(self, x):
-        x = self.sa(x)
-        x = self.feedforward(x)
+        #We prenorm here so the residual connections don't lose the clear gradient highway
+        x = x + self.sa(self.layer_norm1(x))
+        x = x + self.feedforward(self.layer_norm2(x))
 
         return x
-
 
 class BigramLM(nn.Module):
 
@@ -91,7 +123,8 @@ class BigramLM(nn.Module):
             Block(n_embd, num_heads=4),
             Block(n_embd, num_heads=4),
         )
-        self.feedforward = feedforward(n_embd) 
+        self.layerNorm = layerNorm3D(n_embd)
+        self.feedforward = feedforward(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
 
@@ -108,10 +141,9 @@ class BigramLM(nn.Module):
         #Now, each token has an embedding representation, but we have to add dataset dependent info to the embedding 
 
         x = self.blocks(x) #(B, T, n_embd) 
+        x = self.layerNorm(x) 
 
-        #While the tokens are attending each other, they haven't really gotten time to 'talk' to each other. This allows for that
-        out = self.feedforward(x) #(B, T, n_embd) 
-        logits = self.lm_head(out) # (B, T, vocab_size) 
+        logits = self.lm_head(x) # (B, T, vocab_size) 
 
         if targets == None:
             loss=None
@@ -145,7 +177,10 @@ def train_bigram(model,corpus, batch_size, block_size, lr, epochs):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
-    for _ in range (epochs):
+    for epoch in range (epochs):
+
+        if epoch % 1000 == 0: 
+            print(f"Epochs trained: {epoch}") 
 
         xb, yb = corpus.get_batch('train', block_size, batch_size)
         xb = xb.to(device)
@@ -182,7 +217,7 @@ if __name__ == "__main__":
     # # Create a random starting index for the generation, because 0 is our line break
     idx = torch.zeros((1,1), dtype=torch.long, device=device)
 
-    raw_output = model.generate(idx, max_new_tokens=100)
+    raw_output = model.generate(idx, max_new_tokens=250)
     output = corpus.tokenizer.decode(raw_output[0].tolist())
     print(f"output: {output}")
 
