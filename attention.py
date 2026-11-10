@@ -5,6 +5,7 @@ from corpus import Corpus
 import time
 
 device = 'cpu' 
+dropout = 0.2
 
 
 class attentionHead(nn.Module):
@@ -16,6 +17,7 @@ class attentionHead(nn.Module):
         self.key = nn.Linear(n_embd, self.head_size)
         self.query = nn.Linear(n_embd, self.head_size)
         self.value = nn.Linear(n_embd, self.head_size)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
 
@@ -29,6 +31,7 @@ class attentionHead(nn.Module):
         wei = wei.masked_fill(torch.tril(torch.ones((B,T,T), device=device)) == 0, float('-inf'))
         wei = wei / (self.head_size ** 0.5) # We need to scale or softmax will make high values sharpen to one-hot
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         v = self.value(x) #(B, T, head_size)
         out = wei @ v #(B, T, T) @ (B, T, head_size) -> (B, T, head_size)
 
@@ -40,6 +43,7 @@ class multiheadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([attentionHead(n_embd, head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
 
@@ -47,8 +51,8 @@ class multiheadAttention(nn.Module):
         out = torch.cat([head(x) for head in self.heads], dim=-1)
 
         #The reason why we need this is because if we are to combine back with x with addition, the information encoded from the self attention block must align. I.e, the number at 2nd head position encodes its relation with xyz noun, whereas the same position in x might mean something completely different. We didn't have this problem without residual connections because the layers could learn these behaviors by themselves, without conforming back to x. However, we now need a projection layer (one which learns how to map the information in the self attention layer) to help the self attention block conform back to x
-        
         out = self.proj(out)
+        out = self.dropout(out)
         return out
 
 class feedforward(nn.Module):
@@ -63,11 +67,13 @@ class feedforward(nn.Module):
         )
 
         self.proj = nn.Linear(4*n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = self.net(x)
         out = self.proj(out)
-        return out 
+        out = self.dropout(out)
+        return out
 
 class layerNorm3D(nn.Module):
 
@@ -93,6 +99,7 @@ class Block(nn.Module):
 
     def __init__(self, n_embd, num_heads):
         super().__init__()
+        #We want n_embd//head_size here because then, concatenated together, we get n_embd again, which we need for either residuals or the final linear layer
         head_size = n_embd//num_heads
         self.sa = multiheadAttention(n_embd, head_size, num_heads)
         self.feedforward = feedforward(n_embd)
@@ -109,7 +116,7 @@ class Block(nn.Module):
 
 class BigramLM(nn.Module):
 
-    def __init__(self, vocab_size,block_size, n_embd):
+    def __init__(self, num_heads, n_layer, vocab_size,block_size, n_embd):
         super().__init__()
 
         # a look up for for the logit row for each token in the vocab
@@ -117,12 +124,7 @@ class BigramLM(nn.Module):
         self.n_embd = n_embd
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.positional_encoding_table = nn.Embedding(block_size, n_embd)
-        #We want n_embd//4 here because then, concatenated together, we get n_embd again, which we need for either residuals or the final linear layer
-        self.blocks = nn.Sequential(
-            Block(n_embd, num_heads=4),
-            Block(n_embd, num_heads=4),
-            Block(n_embd, num_heads=4),
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, num_heads=num_heads) for _ in range (n_layer)])
         self.layerNorm = layerNorm3D(n_embd)
         self.feedforward = feedforward(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
@@ -173,14 +175,17 @@ class BigramLM(nn.Module):
         return idx
 
 
-def train_bigram(model,corpus, batch_size, block_size, lr, epochs):
+def train_bigram(model,corpus, batch_size, block_size, lr, epochs, eval_iters, eval_interval):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     for epoch in range (epochs):
 
-        if epoch % 1000 == 0: 
-            print(f"Epochs trained: {epoch}") 
+        if epoch % eval_interval == 0: 
+            losses = estimate_loss(model,corpus, eval_iters, block_size, batch_size)
+            print(f"Epoch {epoch} of {epochs}")
+            print(f"training loss: {losses['train']}, eval loss: {losses['eval']}")
+
 
         xb, yb = corpus.get_batch('train', block_size, batch_size)
         xb = xb.to(device)
@@ -191,33 +196,60 @@ def train_bigram(model,corpus, batch_size, block_size, lr, epochs):
         loss.backward()
         optimizer.step()
 
-    print(f"Final loss: {loss.item()}")
+    print(f"Final training loss: {loss.item()}")
+
+@torch.no_grad
+def estimate_loss(model,corpus, eval_iters, block_size, batch_size):
+    """
+    Quickly hop into eval mode and just average the loss over the past eval_iters
+    """
+
+    model.eval()
+    out = {} 
+    for split in ['train', 'eval']:
+        losses = torch.zeros(eval_iters)
+        for i in range (eval_iters):
+            X, Y = corpus.get_batch(split, block_size, batch_size)
+            X, Y = X.to(device), Y.to(device)
+            logits, loss = model(X, Y)
+            losses[i] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
 
 
 if __name__ == "__main__":
 
     #hyperparameters
-    batch_size = 32
-    block_size = 8
+    batch_size = 64
+    block_size = 256
+    n_embd = 384
+    n_head = 6
+    n_layers = 6
     lr = 1e-3
     device='cuda' if torch.cuda.is_available() else 'cpu'
     epochs = 10000
+    #How many interval per epoch we evaluate
+    eval_interval = 300
+    #How many iterations per evaluation do we average the loss over
+    eval_iters = 200
 
     corpus = Corpus("input.txt")
-    model = BigramLM(vocab_size=corpus.tokenizer.vocab_size, block_size=8, n_embd=32).to(device)
+    model = BigramLM(num_heads=n_head, n_layer=n_layers, vocab_size=corpus.tokenizer.vocab_size, block_size=block_size, n_embd=n_embd).to(device)
     # xb, yb = corpus.get_batch('train', block_size=block_size, batch_size=batch_size)
     # logits, loss = model(xb, yb)
     # print(f"Logits: {logits.shape}, Loss: {loss.item()}")
 
 
     start_time = time.time()
-    train_bigram(model, corpus, batch_size=batch_size, block_size=block_size, lr=lr, epochs=epochs)
+    train_bigram(model, corpus, batch_size=batch_size, block_size=block_size, lr=lr, epochs=epochs, eval_iters=eval_iters, eval_interval=eval_interval)
     print(f"Training time: {time.time() - start_time} seconds")
 
     # # Create a random starting index for the generation, because 0 is our line break
     idx = torch.zeros((1,1), dtype=torch.long, device=device)
 
-    raw_output = model.generate(idx, max_new_tokens=250)
+    model.eval()
+    raw_output = model.generate(idx, max_new_tokens=1000)
     output = corpus.tokenizer.decode(raw_output[0].tolist())
     print(f"output: {output}")
 
